@@ -148,7 +148,11 @@ class BigQwery:
         dataset_name: str = "",
         insert_chunk_size: Optional[int] = None,
     ) -> None:
-        """Upsert items that don't yet exist."""
+        """
+        Upsert items that don't yet exist.
+        To be considered a duplicate and not merged the row has to be completely identical, see the ON condition in the
+        sql query.
+        """
 
         if not rows:
             return
@@ -158,6 +162,34 @@ class BigQwery:
         )
         temp_table = bigquery.Table(self.get_table_id(temp_table_name, dataset_name))
         temp_table.schema = self.get_table(table_name, dataset_name).schema
+        columns_name = [field.name for field in temp_table.schema]
         self.client.create_table(temp_table)
 
-        print("table created")
+        if insert_chunk_size is None:
+            insert_chunk_size = self.INSERT_CHUNK_SIZE
+
+        for chunk in ChunkIterator(rows).chunks(insert_chunk_size):
+            errors = self.client.insert_rows_json(
+                self.get_table_id(temp_table_name, dataset_name), chunk
+            )
+
+            if errors:
+                errors_str = f"{errors}"[:1000]
+
+                raise Exception(f"Insertion error: {errors_str}")
+
+        try:
+            on_condition = " AND ".join(
+                [f"target.{col} = source.{col}" for col in columns_name]
+            )
+
+            merge_sql = f"""
+                MERGE `{self.get_table_id(table_name, dataset_name)}` AS target
+                USING `{self.get_table_id(temp_table_name, dataset_name)}` AS source
+                ON {on_condition}
+                WHEN NOT MATCHED BY TARGET THEN
+                    INSERT ROW
+            """
+            self.client.query(merge_sql).result()
+        finally:
+            self.client.delete_table(temp_table)

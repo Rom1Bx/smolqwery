@@ -12,8 +12,18 @@ class Command(BaseCommand):
     between last export and the last revolute day).
     """
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--upsert",
+            action="store_true",
+            default=False,
+            help="Use upsert method for data insertion",
+        )
+
     def handle(self, *args, **options):
         logging.root.setLevel(logging.WARNING)
+
+        use_upsert = options.get("upsert", False)
 
         em = ExtractionManager(default_settings)
         something_new = False
@@ -22,7 +32,7 @@ class Command(BaseCommand):
             self.style.MIGRATE_HEADING(f"Making new Smolqwery extracts:") + "\n"
         )
 
-        for table, date in em.extract_new():
+        for table, date in em.extract_new(use_upsert=use_upsert):
             self.stdout.write(
                 f"  {self.style.MIGRATE_LABEL(table)} - {date.isoformat()}\n"
             )
