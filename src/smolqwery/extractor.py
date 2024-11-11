@@ -477,6 +477,15 @@ class ExtractionManager:
             )
             yield ExtractInfo(table=step.extractor.get_table_name(), date=step.date)
 
+    def test_upsert(self, timestamp_now: Optional[datetime.datetime] = None) -> None:
+        for step in self._extract_new(timestamp_now):
+            self.bq.upsert(
+                table_name=step.extractor.get_table_name(),
+                rows=step.generator,
+            )
+            yield ExtractInfo(table=step.extractor.get_table_name(), date=step.date)
+        print("end extract")
+
 
 class BigQueryType(NamedTuple):
     """
