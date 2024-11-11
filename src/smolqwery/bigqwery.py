@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Dict, Iterator, Optional
 from unittest.mock import MagicMock
 
@@ -134,3 +135,29 @@ class BigQwery:
                 errors_str = f"{errors}"[:1000]
 
                 raise Exception(f"Insertion error: {errors_str}")
+
+    def get_table(self, table_id: str, dataset_name: str) -> bigquery.Table:
+        return self.client.get_table(
+            self.get_table_id(table_id, dataset_name=dataset_name)
+        )
+
+    def upsert(
+        self,
+        table_name: str,
+        rows: Iterator[Dict],
+        dataset_name: str = "",
+        insert_chunk_size: Optional[int] = None,
+    ) -> None:
+        """Upsert items that don't yet exist."""
+
+        if not rows:
+            return
+
+        temp_table_name = (
+            f"{table_name}_temp_{int(datetime.now(timezone.utc).timestamp())}"
+        )
+        temp_table = bigquery.Table(self.get_table_id(temp_table_name, dataset_name))
+        temp_table.schema = self.get_table(table_name, dataset_name).schema
+        self.client.create_table(temp_table)
+
+        print("table created")
