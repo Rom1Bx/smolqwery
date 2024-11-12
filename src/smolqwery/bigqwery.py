@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from .extractor import ExtractorType
 
 from ._utils import ChunkIterator
 from .config import BaseConfigProvider, default_settings
@@ -108,7 +107,7 @@ class BigQwery:
         self,
         table_name: str,
         rows: Iterator[Dict],
-        extractor_type: ExtractorType,
+        extractor_type,
         dataset_name: str = "",
         insert_chunk_size: Optional[int] = None,
     ) -> None:
@@ -144,6 +143,8 @@ class BigQwery:
                     errors_str = f"{errors}"[:1000]
 
                     raise Exception(f"Insertion error: {errors_str}")
+
+            from .extractor import ExtractorType
 
             if extractor_type == ExtractorType.date_aggregated:
                 on_condition = "target.date = source.date"
