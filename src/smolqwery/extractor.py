@@ -459,7 +459,6 @@ class ExtractionManager:
     def extract_new(
         self,
         timestamp_now: Optional[datetime.datetime] = None,
-        use_upsert: bool = False,
     ) -> Iterator[ExtractInfo]:
         """
         The full process of extracting all the data which is new and pouring it
@@ -470,21 +469,13 @@ class ExtractionManager:
         timestamp_now
             When is now? Defaults to the real now but could be another date if
             you don't have a time machine and need to run some tests.
-        use_upsert
-            Do you want to use upsert method, aka the sql's merge operation. It might be less performant but avoid
-            duplicates.
         """
         for step in self._extract_new(timestamp_now):
-            if use_upsert:
-                self.bq.upsert(
-                    table_name=step.extractor.get_table_name(),
-                    rows=step.generator,
-                )
-            else:
-                self.bq.insert_rows(
-                    table_name=step.extractor.get_table_name(),
-                    rows=step.generator,
-                )
+            self.bq.upsert(
+                table_name=step.extractor.get_table_name(),
+                rows=step.generator,
+                extractor_type=step.extractor.get_extractor_type(),
+            )
             yield ExtractInfo(table=step.extractor.get_table_name(), date=step.date)
 
 

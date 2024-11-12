@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from smolqwery import ExtractorType
 
 from ._utils import ChunkIterator
 from .config import BaseConfigProvider, default_settings
@@ -98,44 +99,6 @@ class BigQwery:
 
         return f"{self.get_table_id(table_name, dataset_name)}_delta"
 
-    def insert_rows(
-        self,
-        table_name: str,
-        rows: Iterator[Dict],
-        dataset_name: str = "",
-        insert_chunk_size: Optional[int] = None,
-    ) -> None:
-        """
-        Inserts some rows into the BigQuery table
-
-        Parameters
-        ----------
-        table_name
-            Name of the table (ID will be computed automatically)
-        rows
-            Iterator of rows (they will automatically be inserted by batches
-            of 1000, unless you change the insert_chunk_size).
-        dataset_name
-            If set, inserts the data into this dataset instead of the default
-            one.
-        insert_chunk_size
-            Number of rows to insert at once. Default makes sense, change only
-            if you reach some limits.
-        """
-
-        if insert_chunk_size is None:
-            insert_chunk_size = self.INSERT_CHUNK_SIZE
-
-        for chunk in ChunkIterator(rows).chunks(insert_chunk_size):
-            errors = self.client.insert_rows_json(
-                self.get_table_id(table_name, dataset_name), chunk
-            )
-
-            if errors:
-                errors_str = f"{errors}"[:1000]
-
-                raise Exception(f"Insertion error: {errors_str}")
-
     def get_table(self, table_id: str, dataset_name: str) -> bigquery.Table:
         return self.client.get_table(
             self.get_table_id(table_id, dataset_name=dataset_name)
@@ -145,6 +108,7 @@ class BigQwery:
         self,
         table_name: str,
         rows: Iterator[Dict],
+        extractor_type: ExtractorType,
         dataset_name: str = "",
         insert_chunk_size: Optional[int] = None,
     ) -> None:
@@ -157,31 +121,38 @@ class BigQwery:
         if not rows:
             return
 
-        temp_table_name = (
-            f"{table_name}_temp_{int(datetime.now(timezone.utc).timestamp())}"
-        )
-        temp_table = bigquery.Table(self.get_table_id(temp_table_name, dataset_name))
-        temp_table.schema = self.get_table(table_name, dataset_name).schema
-        columns_name = [field.name for field in temp_table.schema]
-        self.client.create_table(temp_table)
-
-        if insert_chunk_size is None:
-            insert_chunk_size = self.INSERT_CHUNK_SIZE
-
-        for chunk in ChunkIterator(rows).chunks(insert_chunk_size):
-            errors = self.client.insert_rows_json(
-                self.get_table_id(temp_table_name, dataset_name), chunk
-            )
-
-            if errors:
-                errors_str = f"{errors}"[:1000]
-
-                raise Exception(f"Insertion error: {errors_str}")
-
         try:
-            on_condition = " AND ".join(
-                [f"target.{col} = source.{col}" for col in columns_name]
+            temp_table_name = (
+                f"{table_name}_temp_{int(datetime.now(timezone.utc).timestamp())}"
             )
+            temp_table = bigquery.Table(
+                self.get_table_id(temp_table_name, dataset_name)
+            )
+            temp_table.schema = self.get_table(table_name, dataset_name).schema
+            columns_name = [field.name for field in temp_table.schema]
+            self.client.create_table(temp_table)
+
+            if insert_chunk_size is None:
+                insert_chunk_size = self.INSERT_CHUNK_SIZE
+
+            for chunk in ChunkIterator(rows).chunks(insert_chunk_size):
+                errors = self.client.insert_rows_json(
+                    self.get_table_id(temp_table_name, dataset_name), chunk
+                )
+
+                if errors:
+                    errors_str = f"{errors}"[:1000]
+
+                    raise Exception(f"Insertion error: {errors_str}")
+
+            if extractor_type == ExtractorType.date_aggregated:
+                on_condition = "target.date = source.date"
+            elif extractor_type == ExtractorType.individual_rows:
+                on_condition = " AND ".join(
+                    [f"target.{col} = source.{col}" for col in columns_name]
+                )
+            else:
+                raise Exception(f"Extractor type error")
 
             merge_sql = f"""
                 MERGE `{self.get_table_id(table_name, dataset_name)}` AS target
