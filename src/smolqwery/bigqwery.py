@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from smolqwery import ExtractorType
+from .extractor import ExtractorType
 
 from ._utils import ChunkIterator
 from .config import BaseConfigProvider, default_settings
