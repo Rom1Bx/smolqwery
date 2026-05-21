@@ -505,15 +505,23 @@ class ExtractionManager:
         self,
         timestamp_now: Optional[datetime.datetime] = None,
         dry_run: bool = False,
+        deadline: Optional[datetime.datetime] = None,
     ) -> Iterator[ExtractInfo]:
         """
         Finds dates with missing data in BigQuery (within the range from
         SMOLQWERY_FIRST_DATE to yesterday) and fills those gaps.
 
-        For each extractor all missing dates are batched into a single
-        BigQuery upsert call — one temp table and one MERGE statement per
-        extractor regardless of how many dates are missing — to minimise
-        BigQuery operations.
+        By default all missing dates for a given extractor are batched into a
+        single BigQuery upsert call to minimise the number of BigQuery
+        operations.
+
+        When ``deadline`` is provided the method switches to a per-date upsert
+        strategy: each date is committed to BigQuery individually before moving
+        on to the next one. Before starting each new date the current time is
+        compared against the deadline; if the deadline has passed the method
+        returns early. This guarantees that any date already committed will be
+        visible to ``get_existing_dates()`` on the next run, so the process
+        picks up exactly where it left off even if the job is killed mid-way.
 
         Parameters
         ----------
@@ -525,6 +533,10 @@ class ExtractionManager:
             is pushed to BigQuery. Each yielded ExtractInfo will carry the
             extracted rows in its ``rows`` attribute so callers can inspect
             them. Useful for previewing what would be upserted.
+        deadline
+            Optional wall-clock deadline. When provided and the current time
+            reaches or exceeds this value the method stops processing new dates
+            and returns. Already-committed dates are safe in BigQuery.
         """
 
         if timestamp_now is None:
@@ -557,6 +569,8 @@ class ExtractionManager:
 
             if dry_run:
                 for date in missing_dates:
+                    if deadline is not None and now() >= deadline:
+                        return
                     rows = list(
                         self._generate_json(
                             extractor=extractor,
@@ -569,6 +583,26 @@ class ExtractionManager:
                     yield ExtractInfo(
                         table=extractor.get_table_name(), date=date, rows=rows
                     )
+            elif deadline is not None:
+                # Per-date upserts so that partial progress is always committed.
+                for date in missing_dates:
+                    if now() >= deadline:
+                        return
+                    rows = list(
+                        self._generate_json(
+                            extractor=extractor,
+                            date=date,
+                            generator=extractor.extract(
+                                zero_date(date), exclusive_date(date)
+                            ),
+                        )
+                    )
+                    self.bq.upsert(
+                        table_name=extractor.get_table_name(),
+                        rows=rows,
+                        extractor_type=extractor.get_extractor_type(),
+                    )
+                    yield ExtractInfo(table=extractor.get_table_name(), date=date)
             else:
                 self.bq.upsert(
                     table_name=extractor.get_table_name(),

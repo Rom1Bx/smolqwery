@@ -302,3 +302,70 @@ class FillGapsTest(TransactionTestCase):
         self.assertEqual(results, [])
         mock_upsert.assert_not_called()
 
+    def test_fill_gaps_deadline_stops_early(self):
+        """
+        When a deadline in the past is passed, fill_gaps() should stop before
+        processing any dates and make no upsert calls, so that data already
+        committed on a previous (partial) run is not overwritten.
+        """
+        em = ExtractionManager(default_settings)
+
+        existing = {datetime.date(2022, 1, 1), datetime.date(2022, 1, 5)}
+        # A deadline already in the past means the very first date check fires.
+        past_deadline = parse_datetime("2022-01-01T00:00:00+0100")
+
+        with patch.object(BaseExtractor, "get_existing_dates", return_value=existing):
+            with patch.object(em.bq, "upsert") as mock_upsert:
+                results = list(
+                    em.fill_gaps(
+                        timestamp_now=parse_datetime("2022-01-06T00:00:00+0100"),
+                        deadline=past_deadline,
+                    )
+                )
+
+        self.assertEqual(results, [])
+        mock_upsert.assert_not_called()
+
+    def test_fill_gaps_deadline_per_date_upserts(self):
+        """
+        When a deadline is provided, fill_gaps() must upsert one date at a
+        time (not a single batch per extractor) so that partial progress
+        survives a timeout.
+        """
+        em = ExtractionManager(default_settings)
+
+        existing = {datetime.date(2022, 1, 1), datetime.date(2022, 1, 5)}
+        upsert_calls = []
+
+        def capture_upsert(table_name, rows, extractor_type, **kwargs):
+            upsert_calls.append((table_name, list(rows)))
+
+        # A deadline far in the future so all dates are processed.
+        future_deadline = parse_datetime("2099-01-01T00:00:00+0000")
+
+        with patch.object(BaseExtractor, "get_existing_dates", return_value=existing):
+            with patch.object(em.bq, "upsert", side_effect=capture_upsert):
+                results = list(
+                    em.fill_gaps(
+                        timestamp_now=parse_datetime("2022-01-06T00:00:00+0100"),
+                        deadline=future_deadline,
+                    )
+                )
+
+        expected_missing = [
+            datetime.date(2022, 1, 2),
+            datetime.date(2022, 1, 3),
+            datetime.date(2022, 1, 4),
+        ]
+
+        result_by_table = {}
+        for info in results:
+            result_by_table.setdefault(info.table, []).append(info.date)
+
+        self.assertEqual(sorted(result_by_table["user"]), expected_missing)
+        self.assertEqual(sorted(result_by_table["email"]), expected_missing)
+
+        # With a deadline, each date must get its own upsert (one per
+        # extractor × date, not one per extractor).
+        self.assertEqual(len(upsert_calls), len(expected_missing) * 2)
+
