@@ -259,8 +259,8 @@ class FillGapsTest(TransactionTestCase):
                 )
 
         result_by_table = {}
-        for table, date in results:
-            result_by_table.setdefault(table, []).append(date)
+        for info in results:
+            result_by_table.setdefault(info.table, []).append(info.date)
 
         expected_missing = [
             datetime.date(2022, 1, 2),

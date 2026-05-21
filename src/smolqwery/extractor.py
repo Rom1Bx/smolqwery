@@ -375,11 +375,15 @@ class ExtractStep(Generic[D]):
 
 class ExtractInfo(NamedTuple):
     """
-    Extraction progress report for CLI
+    Extraction progress report for CLI.
+
+    In dry-run mode ``rows`` contains the extracted data that would have been
+    pushed to BigQuery; otherwise it is ``None``.
     """
 
     table: str
     date: datetime.date
+    rows: Optional[list] = None
 
 
 class ExtractionManager:
@@ -500,6 +504,7 @@ class ExtractionManager:
     def fill_gaps(
         self,
         timestamp_now: Optional[datetime.datetime] = None,
+        dry_run: bool = False,
     ) -> Iterator[ExtractInfo]:
         """
         Finds dates with missing data in BigQuery (within the range from
@@ -515,6 +520,11 @@ class ExtractionManager:
         timestamp_now
             When is now? Defaults to the real now but can be overridden
             for testing.
+        dry_run
+            When True, rows are extracted and yielded as normal but no data
+            is pushed to BigQuery. Each yielded ExtractInfo will carry the
+            extracted rows in its ``rows`` attribute so callers can inspect
+            them. Useful for previewing what would be upserted.
         """
 
         if timestamp_now is None:
@@ -545,14 +555,29 @@ class ExtractionManager:
                         generator=ext.extract(zero_date(date), exclusive_date(date)),
                     )
 
-            self.bq.upsert(
-                table_name=extractor.get_table_name(),
-                rows=_all_rows(extractor, missing_dates),
-                extractor_type=extractor.get_extractor_type(),
-            )
+            if dry_run:
+                for date in missing_dates:
+                    rows = list(
+                        self._generate_json(
+                            extractor=extractor,
+                            date=date,
+                            generator=extractor.extract(
+                                zero_date(date), exclusive_date(date)
+                            ),
+                        )
+                    )
+                    yield ExtractInfo(
+                        table=extractor.get_table_name(), date=date, rows=rows
+                    )
+            else:
+                self.bq.upsert(
+                    table_name=extractor.get_table_name(),
+                    rows=_all_rows(extractor, missing_dates),
+                    extractor_type=extractor.get_extractor_type(),
+                )
 
-            for date in missing_dates:
-                yield ExtractInfo(table=extractor.get_table_name(), date=date)
+                for date in missing_dates:
+                    yield ExtractInfo(table=extractor.get_table_name(), date=date)
 
     def extract_new(
         self,
