@@ -1,3 +1,6 @@
+import datetime
+from unittest.mock import patch
+
 from core.models import Contract, EmailMessage, User
 from core.smolqwery import UserExtractor
 from dateutil.relativedelta import relativedelta
@@ -6,6 +9,7 @@ from django.utils.dateparse import parse_datetime
 
 from smolqwery import ExtractionManager, default_settings
 from smolqwery._utils import date_range
+from smolqwery.extractor import BaseExtractor
 
 
 def flatten_steps(steps):
@@ -205,3 +209,96 @@ class ExtractorTest(TransactionTestCase):
         self.assertEqual(
             [{"users": 9, "prospects": 4, "clients": 3, "date": "2022-01-05"}], data
         )
+
+
+class FillGapsTest(TransactionTestCase):
+    """
+    Tests for ExtractionManager.fill_gaps().
+
+    BigQuery interactions are replaced by mocks so that we can exercise the
+    gap-detection and batching logic without a real BigQuery connection.
+    """
+
+    def setUp(self):
+        User.objects.bulk_create(
+            [
+                User(
+                    date_create=parse_datetime("2022-01-01T12:00:00+0100"),
+                    personal_info="a",
+                ),
+                User(
+                    date_create=parse_datetime("2022-01-03T12:00:00+0100"),
+                    personal_info="b",
+                ),
+                User(
+                    date_create=parse_datetime("2022-01-05T12:00:00+0100"),
+                    personal_info="c",
+                ),
+            ]
+        )
+
+    def test_fill_gaps_fills_missing_dates(self):
+        """
+        When BQ already holds data for Jan 1 and Jan 5, fill_gaps() should
+        extract Jan 2, 3, 4 and batch them into a single upsert per extractor.
+        """
+        em = ExtractionManager(default_settings)
+
+        existing = {datetime.date(2022, 1, 1), datetime.date(2022, 1, 5)}
+        upsert_calls = []
+
+        def capture_upsert(table_name, rows, extractor_type, **kwargs):
+            upsert_calls.append((table_name, list(rows)))
+
+        with patch.object(BaseExtractor, "get_existing_dates", return_value=existing):
+            with patch.object(em.bq, "upsert", side_effect=capture_upsert):
+                results = list(
+                    em.fill_gaps(
+                        timestamp_now=parse_datetime("2022-01-06T00:00:00+0100")
+                    )
+                )
+
+        result_by_table = {}
+        for table, date in results:
+            result_by_table.setdefault(table, []).append(date)
+
+        expected_missing = [
+            datetime.date(2022, 1, 2),
+            datetime.date(2022, 1, 3),
+            datetime.date(2022, 1, 4),
+        ]
+
+        # Both extractors should report the three missing dates
+        self.assertEqual(sorted(result_by_table["user"]), expected_missing)
+        self.assertEqual(sorted(result_by_table["email"]), expected_missing)
+
+        # Each extractor must produce exactly ONE upsert call (not one per date)
+        self.assertEqual(len(upsert_calls), 2)
+
+        # Verify that the user rows span all three missing dates
+        user_rows = next(rows for name, rows in upsert_calls if name == "user")
+        row_dates = {row["date"] for row in user_rows}
+        for d in expected_missing:
+            self.assertIn(d.isoformat(), row_dates)
+
+    def test_fill_gaps_no_gaps(self):
+        """
+        When all expected dates are already present in BQ, fill_gaps() should
+        produce no output and make no upsert calls.
+        """
+        em = ExtractionManager(default_settings)
+
+        # Every date from Jan 1 to Jan 5 is present
+        existing = {datetime.date(2022, 1, d) for d in range(1, 6)}
+
+        with patch.object(BaseExtractor, "get_existing_dates", return_value=existing):
+            with patch.object(em.bq, "upsert") as mock_upsert:
+                results = list(
+                    em.fill_gaps(
+                        timestamp_now=parse_datetime("2022-01-06T00:00:00+0100")
+                    )
+                )
+
+        self.assertEqual(results, [])
+        mock_upsert.assert_not_called()
+

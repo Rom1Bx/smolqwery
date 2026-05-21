@@ -291,6 +291,47 @@ class BaseExtractor(ABC, Generic[D]):
             "table_name": self.get_table_name(),
         }
 
+    def get_existing_dates(self) -> Set[datetime.date]:
+        """
+        Queries BigQuery for all dates that already have data in this
+        extractor's table. Used by fill_gaps() to detect which dates are
+        missing.
+
+        For date-aggregated extractors the date column is queried directly.
+        For individual-rows extractors the timestamp column is cast to DATE
+        so that each distinct day counts as one entry.
+        """
+
+        date_field = self.get_date_field()
+
+        if self.get_extractor_type() == ExtractorType.date_aggregated:
+            query = (
+                f"SELECT `{date_field}` as date "
+                f"FROM `{self.bq.get_table_id(self.get_table_name())}`"
+            )
+        else:
+            query = (
+                f"SELECT DISTINCT DATE(`{date_field}`) as date "
+                f"FROM `{self.bq.get_table_id(self.get_table_name())}`"
+            )
+
+        job = self.bq.client.query(query)
+
+        if job.errors:
+            raise Exception(
+                f'Errors while getting existing dates: {f"{job.errors}"[:1000]}'
+            )
+
+        existing: Set[datetime.date] = set()
+
+        for row in job.result():
+            d = row.date
+            if isinstance(d, datetime.datetime):
+                d = d.date()
+            existing.add(d)
+
+        return existing
+
     def get_latest_extract_date(self) -> datetime.date:
         """
         Digs into the table to find the most recent entry's date. This helps
@@ -455,6 +496,63 @@ class ExtractionManager:
                     ),
                     date=date,
                 )
+
+    def fill_gaps(
+        self,
+        timestamp_now: Optional[datetime.datetime] = None,
+    ) -> Iterator[ExtractInfo]:
+        """
+        Finds dates with missing data in BigQuery (within the range from
+        SMOLQWERY_FIRST_DATE to yesterday) and fills those gaps.
+
+        For each extractor all missing dates are batched into a single
+        BigQuery upsert call — one temp table and one MERGE statement per
+        extractor regardless of how many dates are missing — to minimise
+        BigQuery operations.
+
+        Parameters
+        ----------
+        timestamp_now
+            When is now? Defaults to the real now but can be overridden
+            for testing.
+        """
+
+        if timestamp_now is None:
+            timestamp_now = now()
+
+        first_date = self.settings.first_date
+
+        for extractor_class in self.settings.get_extractors():
+            extractor = extractor_class(settings=self.settings, bq=self.bq)
+
+            expected_dates = set(
+                date_range(
+                    first_date - relativedelta(days=1),
+                    timestamp_now,
+                )
+            )
+            existing_dates = extractor.get_existing_dates()
+            missing_dates = sorted(expected_dates - existing_dates)
+
+            if not missing_dates:
+                continue
+
+            def _all_rows(ext, dates):
+                for date in dates:
+                    yield from self._generate_json(
+                        extractor=ext,
+                        date=date,
+                        generator=ext.extract(zero_date(date), exclusive_date(date)),
+                    )
+
+            self.bq.upsert(
+                table_name=extractor.get_table_name(),
+                rows=_all_rows(extractor, missing_dates),
+                extractor_type=extractor.get_extractor_type(),
+            )
+
+            for date in missing_dates:
+                yield ExtractInfo(table=extractor.get_table_name(), date=date)
 
     def extract_new(
         self,
