@@ -291,6 +291,47 @@ class BaseExtractor(ABC, Generic[D]):
             "table_name": self.get_table_name(),
         }
 
+    def get_existing_dates(self) -> Set[datetime.date]:
+        """
+        Queries BigQuery for all dates that already have data in this
+        extractor's table. Used by fill_gaps() to detect which dates are
+        missing.
+
+        For date-aggregated extractors the date column is queried directly.
+        For individual-rows extractors the timestamp column is cast to DATE
+        so that each distinct day counts as one entry.
+        """
+
+        date_field = self.get_date_field()
+
+        if self.get_extractor_type() == ExtractorType.date_aggregated:
+            query = (
+                f"SELECT `{date_field}` as date "
+                f"FROM `{self.bq.get_table_id(self.get_table_name())}`"
+            )
+        else:
+            query = (
+                f"SELECT DISTINCT DATE(`{date_field}`) as date "
+                f"FROM `{self.bq.get_table_id(self.get_table_name())}`"
+            )
+
+        job = self.bq.client.query(query)
+
+        if job.errors:
+            raise Exception(
+                f'Errors while getting existing dates: {f"{job.errors}"[:1000]}'
+            )
+
+        existing: Set[datetime.date] = set()
+
+        for row in job.result():
+            d = row.date
+            if isinstance(d, datetime.datetime):
+                d = d.date()
+            existing.add(d)
+
+        return existing
+
     def get_latest_extract_date(self) -> datetime.date:
         """
         Digs into the table to find the most recent entry's date. This helps
@@ -334,11 +375,15 @@ class ExtractStep(Generic[D]):
 
 class ExtractInfo(NamedTuple):
     """
-    Extraction progress report for CLI
+    Extraction progress report for CLI.
+
+    In dry-run mode ``rows`` contains the extracted data that would have been
+    pushed to BigQuery; otherwise it is ``None``.
     """
 
     table: str
     date: datetime.date
+    rows: Optional[list] = None
 
 
 class ExtractionManager:
@@ -455,6 +500,118 @@ class ExtractionManager:
                     ),
                     date=date,
                 )
+
+    def fill_gaps(
+        self,
+        timestamp_now: Optional[datetime.datetime] = None,
+        dry_run: bool = False,
+        deadline: Optional[datetime.datetime] = None,
+    ) -> Iterator[ExtractInfo]:
+        """
+        Finds dates with missing data in BigQuery (within the range from
+        SMOLQWERY_FIRST_DATE to yesterday) and fills those gaps.
+
+        By default all missing dates for a given extractor are batched into a
+        single BigQuery upsert call to minimise the number of BigQuery
+        operations.
+
+        When ``deadline`` is provided the method switches to a per-date upsert
+        strategy: each date is committed to BigQuery individually before moving
+        on to the next one. Before starting each new date the current time is
+        compared against the deadline; if the deadline has passed the method
+        returns early. This guarantees that any date already committed will be
+        visible to ``get_existing_dates()`` on the next run, so the process
+        picks up exactly where it left off even if the job is killed mid-way.
+
+        Parameters
+        ----------
+        timestamp_now
+            When is now? Defaults to the real now but can be overridden
+            for testing.
+        dry_run
+            When True, rows are extracted and yielded as normal but no data
+            is pushed to BigQuery. Each yielded ExtractInfo will carry the
+            extracted rows in its ``rows`` attribute so callers can inspect
+            them. Useful for previewing what would be upserted.
+        deadline
+            Optional wall-clock deadline. When provided and the current time
+            reaches or exceeds this value the method stops processing new dates
+            and returns. Already-committed dates are safe in BigQuery.
+        """
+
+        if timestamp_now is None:
+            timestamp_now = now()
+
+        first_date = self.settings.first_date
+
+        for extractor_class in self.settings.get_extractors():
+            extractor = extractor_class(settings=self.settings, bq=self.bq)
+
+            expected_dates = set(
+                date_range(
+                    first_date - relativedelta(days=1),
+                    timestamp_now,
+                )
+            )
+            existing_dates = extractor.get_existing_dates()
+            missing_dates = sorted(expected_dates - existing_dates)
+
+            if not missing_dates:
+                continue
+
+            def _all_rows(ext, dates):
+                for date in dates:
+                    yield from self._generate_json(
+                        extractor=ext,
+                        date=date,
+                        generator=ext.extract(zero_date(date), exclusive_date(date)),
+                    )
+
+            if dry_run:
+                for date in missing_dates:
+                    if deadline is not None and now() >= deadline:
+                        return
+                    rows = list(
+                        self._generate_json(
+                            extractor=extractor,
+                            date=date,
+                            generator=extractor.extract(
+                                zero_date(date), exclusive_date(date)
+                            ),
+                        )
+                    )
+                    yield ExtractInfo(
+                        table=extractor.get_table_name(), date=date, rows=rows
+                    )
+            elif deadline is not None:
+                # Per-date upserts so that partial progress is always committed.
+                for date in missing_dates:
+                    if now() >= deadline:
+                        return
+                    rows = list(
+                        self._generate_json(
+                            extractor=extractor,
+                            date=date,
+                            generator=extractor.extract(
+                                zero_date(date), exclusive_date(date)
+                            ),
+                        )
+                    )
+                    self.bq.upsert(
+                        table_name=extractor.get_table_name(),
+                        rows=rows,
+                        extractor_type=extractor.get_extractor_type(),
+                    )
+                    yield ExtractInfo(table=extractor.get_table_name(), date=date)
+            else:
+                self.bq.upsert(
+                    table_name=extractor.get_table_name(),
+                    rows=_all_rows(extractor, missing_dates),
+                    extractor_type=extractor.get_extractor_type(),
+                )
+
+                for date in missing_dates:
+                    yield ExtractInfo(table=extractor.get_table_name(), date=date)
 
     def extract_new(
         self,
